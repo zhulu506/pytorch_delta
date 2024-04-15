@@ -2951,6 +2951,7 @@
   dispatch:
     CPU: gelu_backward_cpu
     CUDA: gelu_backward_cuda
+    Checkpoint: checkpoint_gelu_backward
 
 - func: hardshrink(Tensor self, Scalar lambd=0.5) -> Tensor
   use_c10_dispatcher: full

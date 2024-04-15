@@ -771,6 +771,14 @@ Tensor checkpoint_gelu(at::Tensor const& a) {
   return CheckpointTensorImpl::make("gelu", rt, {a})[0];
 }
 
+Tensor checkpoint_gelu_backward(at::Tensor const& a, at::Tensor const& b) {
+  rematerialize_function_t rt =
+    [=](const Tensors& vec) -> Tensors {
+      return {at::gelu_backward(vec.at(0), vec.at(1))};
+    };
+  return CheckpointTensorImpl::make("gelu_backward", rt, {a, b})[0];
+}
+
 Tensor checkpoint_matmul(at::Tensor const& a, at::Tensor const& b) {
   rematerialize_function_t rt =
     [=](const Tensors& vec) -> Tensors {
