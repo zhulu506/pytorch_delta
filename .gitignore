@@ -47,6 +47,7 @@ test/generated_type_hints_smoketest.py
 test/htmlcov
 test/cpp_extensions/install/
 test/test-reports/
+third_party/
 third_party/build/
 tools/shared/_utils_internal.py
 torch.egg-info/
