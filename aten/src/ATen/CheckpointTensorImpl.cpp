@@ -1,3 +1,8 @@
+#include <chrono>
+#include <string>
+#include <random>
+#include <cmath>
+
 #include <ATen/CheckpointTensorImpl.h>
 #include <ATen/Logger.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -5,12 +10,6 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/core/Allocator.h>
-
-
-#include <chrono>
-#include <string>
-#include <random>
-#include <cmath>
 
 namespace at {
 
@@ -127,22 +126,20 @@ inline size_t memory(const Tensor& t) {
 Timer::~Timer() {
   Time now = Clock::now();
   Duration elapsed = now - start;
-  PerfStats::TimerStats stats = { name , start, now, elapsed };
+  PerfStats::TimerStats stats = { name, start, now, elapsed};
   STATS.timers.push_back(stats);
 }
 
-bool use_log_ = true;
-bool use_profile_ = true;
+/*DELTA: Set use_log_ & use_profile_ True*/
+bool use_log_ = false;
+bool use_profile_ = false;
 long base_compute_time_ = 0;
 long remat_compute_time_ = 0;
 long search_time_ = 0;
 long cost_time_ = 0;
 
-long total_count = 0;
-long evict_count = 0;
-long offload_count = 0;
-
 CheckpointPool pool;
+
 void CheckpointPool::add(const intrusive_ptr<AliasPool>& p) {
   if (p->memory > 0 && (memory_count == 0 || !ignore_small_tensors || p->memory >= 0.01 * double(memory_sum/memory_count))) {
     aps.push_back(weak_intrusive_ptr<AliasPool>(p));
@@ -158,37 +155,50 @@ long current_memory() {
 void CheckpointPool::auto_evict() {
   STATS.track("CheckpointPool::auto_evict");
   if (has_memory_budget) {
+    /*DELTA: Call Prefetch*/
     // if (!offload_queue.empty() && current_memory() < memory_budget) {
     //   prefetch();
     // }
     while (current_memory() > memory_budget) {
-      // std::cout << "current memory is: " << current_memory() << std::endl;
       evict();
     }
   }
 }
 
+/*DELTA: Release Count*/
+/*TODO: 每轮 step 训练时重新计数*/
+long total_count = 0;
+long evict_count = 0;
+long offload_count = 0;
+
 void CheckpointPool::evict() {
   time_t pre = std::chrono::system_clock::now();
+
   STATS.track("CheckpointPool::evict");
+
   TORCH_CHECK(aps.size() > 0);
-  // shrunk: either something has been evicted or the pools have gotten smaller
+
   bool shrunk = false;
   int evict_idx = -1;
+  /*DELTA: evict_cost -> filter_score*/
   double filter_score = INFINITY;
+
   time_t current_time = std::chrono::system_clock::now();
+
   auto remove_from_aps = [&](size_t i) {
                            aps[i] = aps[aps.size() - 1];
                            aps.pop_back();
                          };
+
   std::uniform_int_distribution<> distrib(1, 1 * std::max(1, static_cast<int>(std::sqrt(aps.size()))));
-  // sampling a random independent subset of all evictable tensors to find the cheapest tensor to evict.
-  // std::cout << "aps size: " << aps.size() << std::endl;
+
+  /*Search*/
   for (size_t i = 0; i < aps.size();) {
     auto cannot_evict = [&]() {
                           shrunk = true;
                           remove_from_aps(i);
                         };
+                        
     auto ap_strong = aps[i].lock();
     if (!ap_strong.defined()) {
       cannot_evict();
@@ -196,18 +206,19 @@ void CheckpointPool::evict() {
     else if (ap_strong->ecn) {
       cannot_evict();
     } 
+    /*DELTA*/
     else if (ap_strong->is_offloaded) {
       cannot_evict();
     } 
     else {
       if (ap_strong->evictable()) {
         double cost = ap_strong->cost(current_time);
+        /*DELTA: evict_cost -> filter_score*/
         if (cost < filter_score) {
           filter_score = cost;
           evict_idx = i;
         }
       }
-
       if (sample_tensors) {
         i += distrib(gen);
       } else {
@@ -215,27 +226,36 @@ void CheckpointPool::evict() {
       }
     }
   }
-  // std::cout << "evict idx " << evict_idx << std::endl;
+
+  /*Search Time*/
+  time_t post = std::chrono::system_clock::now();
+  search_time_ += (post - pre).count();
+
+  /*Release*/
   if (evict_idx == -1) {
     TORCH_CHECK(shrunk);
   } else {
+    /*DELTA: Decision*/
     auto release_aps = aps[evict_idx].lock();
     double real_decision;
-    std::cout << "release_aps->swapped " << release_aps->swapped << std::endl;
+    /*DELTA: 这里为什么有两种计算 real_decision 的情况？*/
     if (release_aps->swapped) {
       double _computed_cost = release_aps->compute_cost_func(current_time);
+      /*DELTA: 这个 swap_cost 是怎么计算出来的？*/
       double _swap_cost = release_aps->swap_cost;
       real_decision = _swap_cost / _computed_cost;
     } else {
       real_decision = release_aps->decision_func(current_time);
     }
-    std::cout << "decision is  " << real_decision << std::endl;
+
+    /*Evict*/
     auto evict_from_idx = [&](size_t idx) {
                             auto ap_strong = aps[idx].lock();
                             TORCH_CHECK(ap_strong.defined());
                             ap_strong->evict();
                             remove_from_aps(evict_idx);
                           };
+    /*Offload*/
     auto offload_from_idx = [&](size_t idx){
                             auto ap_strong = aps[idx].lock();
                             TORCH_CHECK(ap_strong.defined());
@@ -244,32 +264,27 @@ void CheckpointPool::evict() {
                           };
     total_count += 1;
     if (real_decision > 1) {
+      /*DELTA: 重计算*/
       evict_from_idx(evict_idx);
       evict_count += 1;
-      // std::cout << "evict aaaaa" << std::endl;
-      // offload_from_idx(evict_idx);
     } else {
-      // evict_from_idx(evict_idx);
       offload_from_idx(evict_idx);
       offload_count += 1;
-      // auto ap_strong = aps[evict_idx].lock();
-      // TORCH_CHECK(ap_strong.defined());
-      // remove_from_aps(evict_idx);
     }
   }
+
   std::cout << "total count is: " << total_count << std::endl;
   std::cout << "evict count is: " << evict_count << std::endl;
-  std::cout << "offload count is: " << offload_count << std::endl; 
-
-  time_t post = std::chrono::system_clock::now();
-  search_time_ += (post - pre).count();
+  std::cout << "offload count is: " << offload_count << std::endl;
 }
 
+/*DELTA: Prefetch Function*/
+/*TODO: 预取的时机需要再考虑，怎么具体地实现*/
 void CheckpointPool::prefetch() {
   if (offload_queue.empty()) {
     return;
   }
-  strong front_operand = offload_queue.front();
+  intrusive_ptr<CheckpointTensorCell> front_operand = offload_queue.front();
   if (front_operand) {
     for (int i=0; i < prefetch_count; i++) {
       auto total_memory = current_memory() + memory(front_operand->get());
@@ -287,9 +302,13 @@ void CheckpointPool::prefetch() {
   return; 
 }
 
-CheckpointPool::CheckpointPool() { }
-
 namespace native {
+
+bool is_checkpoint(const Tensor& t) {
+  STATS.track("is_checkpoint");
+  auto* cpti = dynamic_cast<CheckpointTensorImpl*>(t.unsafeGetTensorImpl());
+  return cpti != nullptr;
+}
 
 Tensor checkpoint(const Tensor& t) {
   STATS.track("checkpoint");
@@ -301,11 +320,22 @@ Tensor checkpoint(const Tensor& t) {
   return Tensor(cpti);
 }
 
+Tensor try_checkpoint(const Tensor& t) {
+  STATS.track("try_checkpiont");
+  return is_checkpoint(t) ? t : checkpoint(t);
+}
+
 Tensor uncheckpoint(const Tensor& t) {
   STATS.track("uncheckpoint");
   auto* cpti = dynamic_cast<CheckpointTensorImpl*>(t.unsafeGetTensorImpl());
   TORCH_CHECK(cpti != nullptr);
   return cpti->ref->value->value->get();
+}
+
+Tensor decheckpoint(const Tensor& t) {
+  STATS.track("decheckpoint");
+  auto* cpti = dynamic_cast<CheckpointTensorImpl*>(t.unsafeGetTensorImpl());
+  return cpti ? cpti->ref->value->value->get() : t;
 }
 
 void pin(Tensor& t) {
@@ -315,21 +345,65 @@ void pin(Tensor& t) {
   cpti->ref->value->value->pin();
 }
 
-Tensor decheckpoint(const Tensor& t) {
-  STATS.track("decheckpoint");
-  auto* cpti = dynamic_cast<CheckpointTensorImpl*>(t.unsafeGetTensorImpl());
-  return cpti ? cpti->ref->value->value->get() : t;
+void clear_checkpointpool() {
+  while (likely(!pool.exts.empty())) {
+    if (auto e = pool.exts.back().lock()) {
+      e->value->pin();
+    }
+    pool.exts.pop_back();
+  }
 }
 
-bool is_checkpoint(const Tensor& t) {
-  STATS.track("is_checkpoint");
-  auto* cpti = dynamic_cast<CheckpointTensorImpl*>(t.unsafeGetTensorImpl());
-  return cpti != nullptr;
+void unset_memory_budget() {
+  pool.has_memory_budget = false;
 }
 
-Tensor try_checkpoint(const Tensor& t) {
-  STATS.track("try_checkpiont");
-  return is_checkpoint(t) ? t : checkpoint(t);
+void set_memory_budget(long budget) {
+  pool.memory_budget = budget;
+  pool.has_memory_budget = true;
+}
+
+void toggle_sampling(bool sample) {
+  pool.sample_tensors = sample;
+}
+
+void toggle_ignore_small_tensors(bool ignore) {
+  pool.ignore_small_tensors = ignore;
+}
+
+void toggle_profile(bool profile) {
+  use_profile_ = profile;
+}
+
+void reset_profile() {
+  base_compute_time_ = 0;
+  remat_compute_time_ = 0;
+  search_time_ = 0;
+  cost_time_ = 0;
+}
+
+long base_compute_time() {
+  return base_compute_time_;
+}
+
+long remat_compute_time() {
+  return remat_compute_time_;
+}
+
+long compute_time() {
+  return base_compute_time() + remat_compute_time();
+}
+
+long search_time() {
+  return search_time_;
+}
+
+long cost_time() {
+  return cost_time_;
+}
+
+long loop_time() {
+  return search_time() - cost_time();
 }
 
 void new_log(std::string str) {
@@ -352,105 +426,29 @@ void toggle_log(bool b) {
   use_log_ = b;
 }
 
-void clear_checkpointpool() {
-  while (likely(!pool.exts.empty())) {
-    if (auto e = pool.exts.back().lock()) {
-      e->value->pin();
-    }
-    pool.exts.pop_back();
+}
+
+Tensors try_checkpoint(const Tensors& inputs) {
+  STATS.track("try_checkpoint");
+  Tensors ret;
+  ret.reserve(inputs.size());
+  for (const Tensor& input : inputs) {
+    ret.push_back(at::native::try_checkpoint(input));
   }
-}
-
-void unset_memory_budget() {
-  pool.has_memory_budget = false;
-}
-
-void set_memory_budget(long budget) {
-  std::cout << "memory budget: " << budget << std::endl;
-  pool.memory_budget = budget;
-  pool.has_memory_budget = true;
-}
-
-void toggle_sampling(bool sample) {
-  pool.sample_tensors = sample;
-}
-
-void toggle_ignore_small_tensors(bool ignore) {
-  pool.ignore_small_tensors = ignore;
-}
-
-void reset_profile() {
-  base_compute_time_ = 0;
-  remat_compute_time_ = 0;
-  search_time_ = 0;
-  cost_time_ = 0;
-}
-
-void toggle_profile(bool profile) {
-  use_profile_ = profile;
-}
-
-long compute_time() {
-  return base_compute_time() + remat_compute_time();
-}
-
-long cost_time() {
-  return cost_time_;
-}
-
-long search_time() {
-  return search_time_;
-}
-
-long remat_compute_time() {
-  return remat_compute_time_;
-}
-
-long base_compute_time() {
-  return base_compute_time_;
-}
-
-long loop_time() {
-  return search_time() - cost_time();
-}
-
-}
-
-void CheckpointTensorCell::reload() {
-  STATS.track("AliasPool::reload");
-  onGPU = true;
-  offloaded = false;
-  at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
-  cudaMemcpyKind kind = cudaMemcpyHostToDevice;
-  // size_t res = input->cpuStorage->nbytes();
-  c10::Allocator* allocator = at::cuda::getCUDADeviceAllocator();
-  // auto ptr = std::make_shared<Storage>(Storage::use_byte_size_t(), res, allocator, false);
-  // cudaMemcpyAsync(ptr->data_ptr().get(), input->cpuStorage->data_ptr().get(), res, kind, stream);
-  c10::Device device = optional_device_.value();
-  // std::cout << "device: " << device << std::endl;
-  Tensor gpuTensor = cpuTensor.to(device);
-  cpuTensor.reset();
-  t = std::make_unique<Tensor>(gpuTensor.detach());
-  pool->onGPU = true;
-  pool->is_offloaded = false;
-  at::pool.aps.push_back(weak_intrusive_ptr<AliasPool>(pool));
-  // how to set tensor device and on undefined tensor error
-  // input->cpuStorage.reset();
-  // std::cout << "Reload finished " << std::endl;
-  // return gpuTensor;
+  return ret;
 }
 
 [[inline]]
-Tensor uncheckpoint(const strong& input) {
+Tensor uncheckpoint(const intrusive_ptr<CheckpointTensorCell>& input) {
   return input->get();
 }
 
-Tensors uncheckpoint(strongs& inputs) {
+Tensors uncheckpoint(std::vector<intrusive_ptr<CheckpointTensorCell>>& inputs) {
   STATS.track("uncheckpoint");
   Tensors ret;
   ret.reserve(inputs.size());
-  for (strong& input : inputs) {
-    // inlined manually
+  for (intrusive_ptr<CheckpointTensorCell>& input : inputs) {
+    /*DELTA*/
     // if (!input->onGPU && input->offloaded) {
     //   input->reload();
     //   ret.push_back(input->get());
@@ -466,133 +464,72 @@ Tensors uncheckpoint(strongs& inputs) {
   return ret;
 };
 
-Tensors try_checkpoint(const Tensors& inputs) {
-  STATS.track("try_checkpoint");
-  Tensors ret;
-  ret.reserve(inputs.size());
-  for (const Tensor& input : inputs) {
-    ret.push_back(at::native::try_checkpoint(input));
-  }
-  return ret;
-}
-
-CheckpointInfo merge_cpi(CheckpointInfo l, CheckpointInfo r) {
-  STATS.track("merge_cpi");
-  return CheckpointInfo(l.compute_cost + r.compute_cost);
-}
-
-void AliasPool::evict() {
-  STATS.track("AliasPool::evict");
-  TORCH_CHECK(!ecn);
-  ecn = head_remat->get_ecn();
-  auto ecns = neighbor_ecn();
-  for (const auto& necn : ecns) {
-    merge<CheckpointInfo>(merge_cpi, ecn, necn);
-  }
-  TORCH_CHECK(memory > 0);
-  TORCH_CHECK(lock_count == 0);
-  TORCH_CHECK(!is_evicted);
-  is_evicted = true;
-  onGPU = false;
-  for (const weak& w : tensors) {
-    if (auto cell = w.lock()) {
-      cell->evict();
+void CheckpointTensorCell::fill(const Tensor& t) {
+  STATS.track("CheckpointTensorCell::fill");
+  if (!(this->t)) {
+    this->t = std::make_unique<Tensor>(t.detach());
+    pool->set_not_evicted(pool);
+    if (!defined) {
+      defined = true;
+      is_undefined_tensor = !t.defined();
+      key_set_ = t.key_set();
+      if (t.requires_grad()) {
+        key_set_ = key_set_.add(DispatchKey::Autograd);
+      }
+      dtype_ = t.dtype();
+      optional_device_ = t.optional_device();
     }
   }
 }
 
-void AliasPool::offload() {
-  STATS.track("AliasPool::offload");
-  // TORCH_CHECK(!ecn);
-  // ecn = head_remat->get_ecn();
-  // auto ecns = neighbor_ecn();
-  // for (const auto& necn : ecns) {
-  //   merge<CheckpointInfo>(merge_cpi, ecn, necn);
-  // }
-  TORCH_CHECK(memory > 0);
-  TORCH_CHECK(lock_count == 0);
-  TORCH_CHECK(!is_offloaded);
+/*DELTA: Reload*/
+void CheckpointTensorCell::reload() {
+  STATS.track("AliasPool::reload");
+
+  onGPU = true;
+  offloaded = false;
+
+  /*TODO: 异步数据传输，还未实现*/
   at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
-  cudaMemcpyKind kind = cudaMemcpyDeviceToHost;
-  c10::Allocator* allocator = at::getCPUAllocator();
-  onGPU = false;
-  is_offloaded = true;
-  swapped = true;
-  for (const weak& w : tensors) {
-    if (auto cell = w.lock()) {
-      auto& storage = cell->t->storage();
-      size_t res =  storage.nbytes();
-      // auto dtype_ = cell->t->dtype();
-      time_t pre = std::chrono::system_clock::now();
-      // cell->cpuStorage = std::make_shared<Storage>(Storage::use_byte_size_t(), res, allocator, false);
-      // cudaMemcpyAsync(cell->cpuStorage->data_ptr().get(), storage.data_ptr().get(), res, kind, stream);
-      cell->cpuTensor = cell->t->to(DeviceType::CPU);
-      time_t post = std::chrono::system_clock::now();
-      cell->t.reset();
-      cell->swap_cost = (post - pre).count();
-      cell->onGPU = false;
-      cell->offloaded = true;
-      // std::cout << "offloaded tensor device " << cell->optional_device_.value() << std::endl;
-      // pool.offload_queue.push(cell);
-    }
-  }
-  // std::cout << "offload finished  " << std::endl;
-}
+  cudaMemcpyKind kind = cudaMemcpyHostToDevice;
+  // size_t res = input->cpuStorage->nbytes();
+  c10::Allocator* allocator = at::cuda::getCUDADeviceAllocator();
+  // auto ptr = std::make_shared<Storage>(Storage::use_byte_size_t(), res, allocator, false);
+  // cudaMemcpyAsync(ptr->data_ptr().get(), input->cpuStorage->data_ptr().get(), res, kind, stream);
+  c10::Device device = optional_device_.value();
+  // std::cout << "device: " << device << std::endl;
 
-double AliasPool::cost(time_t current_time) {
-  time_t pre = std::chrono::system_clock::now();
-  auto cpi = head_remat->get_cpi();
-  auto ecns = neighbor_ecn();
-  // for (const auto& necn : ecns) {
-  //   cpi = merge_cpi(cpi, get_t(necn));
-  // }
-  auto ret = cpi.cost(memory, (current_time - last_used_time).count());
-  time_t post = std::chrono::system_clock::now();
-  cost_time_ += (post - pre).count();
-  return ret;
-}
+  Tensor gpuTensor = cpuTensor.to(device);
+  cpuTensor.reset();
 
-double AliasPool::compute_cost_func(time_t current_time) {
-  time_t pre = std::chrono::system_clock::now();
-  auto cpi = head_remat->get_cpi();
-  auto ecns = neighbor_ecn();
-  for (const auto& necn : ecns) {
-    cpi = merge_cpi(cpi, get_t(necn));
-  }
-  auto ret = cpi.compute_cost_func(memory, (current_time - last_used_time).count());
-  time_t post = std::chrono::system_clock::now();
-  cost_time_ += (post - pre).count();
-  return ret;
-}
+  t = std::make_unique<Tensor>(gpuTensor.detach());
 
-double AliasPool::decision_func(time_t current_time) {
-  time_t pre = std::chrono::system_clock::now();
-  auto cpi = head_remat->get_cpi();
-  // auto ecns = neighbor_ecn();
-  // for (const auto& necn : ecns) {
-  //   cpi = merge_cpi(cpi, get_t(necn));
-  // }
-  auto ret = cpi.fake_decision(memory, (current_time - last_used_time).count());
-  time_t post = std::chrono::system_clock::now();
-  return ret;
-}
+  pool->onGPU = true;
+  pool->is_offloaded = false;
+  at::pool.aps.push_back(weak_intrusive_ptr<AliasPool>(pool));
 
-void External::release_resources() {
-  value->pool->release_external();
-  value.reset();
+  // how to set tensor device and on undefined tensor error
+  // input->cpuStorage.reset();
+  // std::cout << "Reload finished " << std::endl;
+  // return gpuTensor;
 }
 
 void Rematerializer::remat() {
-  // TODO: refactor using RAII for exception safety.
-  for (const strong& s : inputs) {
+  for (const intrusive_ptr<CheckpointTensorCell>& s : inputs) {
     s->pool->lock();
   }
+
   Tensors ts = uncheckpoint(inputs);
+
   time_t pre = std::chrono::system_clock::now();
   auto ret = func(ts);
   time_t post = std::chrono::system_clock::now();
+
+  /*疑问：在重计算后再进行auto_evict，那如果在计算过程中OOM怎么办？*/
   pool.auto_evict();
+
   remat_compute_time_ += (post - pre).count();
+
   TORCH_CHECK(ret.size() == outputs.size());
   for (size_t i = 0; i < outputs.size(); ++i) {
     if (auto output_cell = outputs[i].lock()) {
@@ -600,14 +537,14 @@ void Rematerializer::remat() {
     }
   }
   ecn.reset();
-  for (const strong& s : inputs) {
+  for (const intrusive_ptr<CheckpointTensorCell>& s : inputs) {
     s->pool->unlock();
   }
 }
 
-ecn_ptr Rematerializer::get_ecn() {
+intrusive_ptr<EquivalentClassNode<CheckpointInfo>> Rematerializer::get_ecn() {
   if (!ecn) {
-    ecn = ecn_ptr::make(CheckpointInfo(compute_cost));
+    ecn = intrusive_ptr<EquivalentClassNode<CheckpointInfo>>::make(CheckpointInfo(compute_cost));
   }
   return ecn;
 }
@@ -616,9 +553,14 @@ CheckpointInfo Rematerializer::get_cpi() {
   return CheckpointInfo(ecn ? duration_t(0) : compute_cost);
 }
 
-std::set<ecn_ptr> AliasPool::neighbor_ecn() {
+CheckpointInfo merge_cpi(CheckpointInfo l, CheckpointInfo r) {
+  STATS.track("merge_cpi");
+  return CheckpointInfo(l.compute_cost + r.compute_cost);
+}
+
+std::set<intrusive_ptr<EquivalentClassNode<CheckpointInfo>>> AliasPool::neighbor_ecn() {
   STATS.track("AliasPool::neighbor_ecn");
-  std::set<ecn_ptr> ptr_set;
+  std::set<intrusive_ptr<EquivalentClassNode<CheckpointInfo>>> ptr_set;
   int size = neighbors.size();
   for (size_t i = 0; i < size;) {
     if (auto cptc = neighbors[i].lock()) {
@@ -637,6 +579,119 @@ std::set<ecn_ptr> AliasPool::neighbor_ecn() {
   return ptr_set;
 }
 
+void AliasPool::evict() {
+  STATS.track("AliasPool::evict");
+  TORCH_CHECK(!ecn);
+  ecn = head_remat->get_ecn();
+  auto ecns = neighbor_ecn();
+  for (const auto& necn : ecns) {
+    merge<CheckpointInfo>(merge_cpi, ecn, necn);
+  }
+  TORCH_CHECK(memory > 0);
+  TORCH_CHECK(lock_count == 0);
+  TORCH_CHECK(!is_evicted);
+  /*DTR*/
+  is_evicted = true;
+  /*DELTA*/
+  onGPU = false;
+  for (const weak_intrusive_ptr<CheckpointTensorCell>& w : tensors) {
+    if (auto cell = w.lock()) {
+      cell->evict();
+    }
+  }
+}
+
+/*DELTA: offload*/
+/*Call by: CheckpointPool::evict()*/
+void AliasPool::offload() {
+  STATS.track("AliasPool::offload");
+
+  TORCH_CHECK(memory > 0);
+  TORCH_CHECK(lock_count == 0);
+  TORCH_CHECK(!is_offloaded);
+
+  at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream();
+  cudaMemcpyKind kind = cudaMemcpyDeviceToHost;
+  c10::Allocator* allocator = at::getCPUAllocator();
+
+  onGPU = false;
+  is_offloaded = true;
+  swapped = true;
+
+  for (const weak_intrusive_ptr<CheckpointTensorCell>& w : tensors) {
+    if (auto cell = w.lock()) {
+      time_t pre = std::chrono::system_clock::now();
+
+      auto& storage = cell->t->storage();
+      size_t res = storage.nbytes();
+      // auto dtype_ = cell->t->dtype();
+
+      /*TODO: Overloap*/
+      // cell->cpuStorage = std::make_shared<Storage>(Storage::use_byte_size_t(), res, allocator, false);
+      // cudaMemcpyAsync(cell->cpuStorage->data_ptr().get(), storage.data_ptr().get(), res, kind, stream);
+
+      /*TODO: 尽可能 Overloap*/
+      cell->cpuTensor = cell->t->to(DeviceType::CPU);
+      // cell->t.reset();
+      cell->offload();  // 有改动，看看效果是不是一样的
+
+      time_t post = std::chrono::system_clock::now();
+
+      /*疑问：为什么DTR没有更新Cell里的数据？*/
+      cell->swap_cost = (post - pre).count();
+      cell->onGPU = false;
+      cell->offloaded = true;
+
+      // std::cout << "offloaded tensor device " << cell->optional_device_.value() << std::endl;
+
+      /*TODO: Prefetch*/
+      // pool.offload_queue.push(cell);
+    }
+  }
+  // std::cout << "offload finished  " << std::endl;
+}
+
+/*DELTA: Filter Function*/
+double AliasPool::cost(time_t current_time) {
+  time_t pre = std::chrono::system_clock::now();
+
+  auto cpi = head_remat->get_cpi();
+  auto ret = cpi.cost(memory, (current_time - last_used_time).count());
+
+  time_t post = std::chrono::system_clock::now();
+
+  return ret;
+}
+
+/*DTR: Cost Function*/
+double AliasPool::compute_cost_func(time_t current_time) {
+  time_t pre = std::chrono::system_clock::now();
+
+  auto cpi = head_remat->get_cpi();
+  auto ecns = neighbor_ecn();
+  for (const auto& necn : ecns) {
+    cpi = merge_cpi(cpi, get_t(necn));
+  }
+  auto ret = cpi.compute_cost_func(memory, (current_time - last_used_time).count());
+
+  time_t post = std::chrono::system_clock::now();
+  cost_time_ += (post - pre).count();
+
+  return ret;
+}
+
+/*DELTA: Decision Function*/
+double AliasPool::decision_func(time_t current_time) {
+  time_t pre = std::chrono::system_clock::now();
+
+  auto cpi = head_remat->get_cpi();
+  auto ret = cpi.fake_decision(memory, (current_time - last_used_time).count());
+
+  time_t post = std::chrono::system_clock::now();
+  return ret;
+}
+
+/*DTR*/
 void AliasPool::set_not_evicted(const intrusive_ptr<AliasPool>& self) {
   if (unlikely(is_evicted)) {
     STATS.track("AliasPool::set_not_evicted(inside)");
@@ -651,6 +706,8 @@ void AliasPool::set_not_evicted(const intrusive_ptr<AliasPool>& self) {
   }
 }
 
+/*DELTA*/
+/*TODO: 这个函数似乎没有什么用处，还是实现得有问题？*/
 void AliasPool::set_not_offloaded(const intrusive_ptr<AliasPool>& self) {
   if (unlikely(is_offloaded)) {
     STATS.track("AliasPool::set_not_offloaded(inside)");
@@ -665,22 +722,9 @@ void AliasPool::set_not_offloaded(const intrusive_ptr<AliasPool>& self) {
   }
 }
 
-void CheckpointTensorCell::fill(const Tensor& t) {
-  STATS.track("CheckpointTensorCell::fill");
-  if (!(this->t)) {
-    this->t = std::make_unique<Tensor>(t.detach());
-    pool->set_not_evicted(pool);
-    if (!defined) {
-      defined = true;
-      is_undefined_tensor = !t.defined();
-      key_set_ = t.key_set();
-      if (t.requires_grad()) {
-        key_set_ = key_set_.add(DispatchKey::Autograd);
-      }
-      dtype_ = t.dtype();
-      optional_device_ = t.optional_device();
-    }
-  }
+void External::release_resources() {
+  value->pool->release_external();
+  value.reset();
 }
 
 intrusive_ptr<TensorImpl> CheckpointTensorImpl::shallow_copy_and_detach(const VariableVersion& version_counter,
@@ -709,10 +753,6 @@ bool is_alias(const Tensor& l, const Tensor& r) {
   return l.defined() && r.defined() && l.is_alias_of(r);
 }
 
-// return an index for alias.
-// we dont care which one because they all lead to the same alias pool.
-// return -1 for no alias.
-// may god forgive my sin.
 int get_alias(const Tensors& ts, const Tensor& t) {
   if (t.defined()) {
     for (size_t i = 0; i < ts.size(); ++i) {
@@ -724,39 +764,34 @@ int get_alias(const Tensors& ts, const Tensor& t) {
   return -1;
 }
 
-struct MakeRawResult {
-  std::vector<intrusive_ptr<External>> outputs;
-  std::vector<int> aliases;
-  duration_t time;
-  intrusive_ptr<Rematerializer> rematerializer;
-};
-
-void add_neighbor(const strong& l, const strong& r) {
-  l->pool->neighbors.push_back(weak(r));
-  r->pool->neighbors.push_back(weak(l));
+void add_neighbor(const intrusive_ptr<CheckpointTensorCell>& l, const intrusive_ptr<CheckpointTensorCell>& r) {
+  l->pool->neighbors.push_back(weak_intrusive_ptr<CheckpointTensorCell>(r));
+  r->pool->neighbors.push_back(weak_intrusive_ptr<CheckpointTensorCell>(l));
 }
 
-// remat take a single vector of tensors,
-// while there are two vector, one storing nonconstants and one storing constants.
-// the constants are small and they will not be considered for eviction.
-// however, we have to stitch the two vectors together to pass it in remat.
-// the size_t in constants decide the location to stitch them in, while input_values fill in the rest.
 MakeRawResult make_raw(const rematerialize_function_t& remat_f,
-                      strongs& inputs) {
+                      std::vector<intrusive_ptr<CheckpointTensorCell>>& inputs) {
   STATS.track("make_raw");
-  for (const strong& s : inputs) {
+
+  for (const intrusive_ptr<CheckpointTensorCell>& s : inputs) {
     s->pool->lock();
   }
+
   Tensors raw_inputs = uncheckpoint(inputs);
+
   time_t pre = std::chrono::system_clock::now();
   auto raw_outputs = remat_f(raw_inputs);
-
   time_t post = std::chrono::system_clock::now();
+
+  /*TODO: 同样的问题，都计算完了，再去驱逐，峰值内存不应该出现在重计算的过程吗？*/
   pool.auto_evict();
+
   base_compute_time_ += (post - pre).count();
+
   std::vector<intrusive_ptr<External>> outputs;
   std::vector<int> aliases;
-  weaks weak_outputs;
+  std::vector<weak_intrusive_ptr<CheckpointTensorCell>> weak_outputs;
+
   auto remat = intrusive_ptr<Rematerializer>::make(Unsafe(), remat_f, inputs, post - pre);
 
   for (const Tensor& t : raw_outputs) {
@@ -775,10 +810,10 @@ MakeRawResult make_raw(const rematerialize_function_t& remat_f,
     }
     auto e = intrusive_ptr<External>::make(t, alias_pool, remat);
     pool.exts.push_back(weak_intrusive_ptr<External>(e));
-    alias_pool->tensors.push_back(weak(e->value));
+    alias_pool->tensors.push_back(weak_intrusive_ptr<CheckpointTensorCell>(e->value));
     outputs.push_back(e);
     aliases.push_back(alias);
-    weak_outputs.push_back(weak(outputs.back()->value));
+    weak_outputs.push_back(weak_intrusive_ptr<CheckpointTensorCell>(outputs.back()->value));
   }
   remat->outputs = weak_outputs;
   for (size_t i = 0; i < inputs.size(); ++i) {
@@ -788,7 +823,7 @@ MakeRawResult make_raw(const rematerialize_function_t& remat_f,
       }
     }
   }
-  for (const strong& s : inputs) {
+  for (const intrusive_ptr<CheckpointTensorCell>& s : inputs) {
     s->pool->unlock();
   }
   return {outputs, aliases, post - pre, remat};
@@ -805,7 +840,7 @@ Tensors CheckpointTensorImpl::make(const std::string& name,
   Tensors checkpointed_inputs = try_checkpoint(inputs);
   auto input_size = checkpointed_inputs.size();
 
-  strongs input_values;
+  std::vector<intrusive_ptr<CheckpointTensorCell>> input_values;
   input_values.reserve(input_size);
 
   std::vector<std::string> args;
@@ -849,7 +884,6 @@ Tensors CheckpointTensorImpl::make(const std::string& name,
   return tensors;
 }
 
-// TODO: check that mutated value does not have alias.
 void CheckpointTensorImpl::mutate(const std::string& name,
                                   const mutate_function_t& mutate,
                                   const Tensors& inputs,
@@ -863,7 +897,7 @@ void CheckpointTensorImpl::mutate(const std::string& name,
                  return new_input_values;
                };
   Tensors checkpointed_inputs = try_checkpoint(inputs);
-  strongs input_values;
+  std::vector<intrusive_ptr<CheckpointTensorCell>> input_values;
   std::vector<std::string> args;
   for (const Tensor& t: checkpointed_inputs) {
     auto* cpti = dynamic_cast<CheckpointTensorImpl*>(t.unsafeGetTensorImpl());
