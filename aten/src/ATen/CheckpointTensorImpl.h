@@ -4,7 +4,6 @@
 #include <memory>
 #include <numeric>
 #include <random>
-#include <queue>
 
 #include <c10/core/Backend.h>
 #include <c10/core/MemoryFormat.h>
@@ -25,7 +24,7 @@
 
 #define likely(x)      __builtin_expect(!!(x), 1)
 #define unlikely(x)    __builtin_expect(!!(x), 0)
-// #define TORCH_CHECK(a, ...) // profile mode
+#define TORCH_CHECK(a, ...) // profile mode
 
 // System Description:
 // Every Tensor is managed by a CheckpointTensor,
@@ -161,29 +160,11 @@ using time_t = std::chrono::time_point<std::chrono::system_clock>;
 using duration_t = std::chrono::system_clock::duration;
 struct CheckpointInfo {
   duration_t compute_cost;
-  double bandwidth = 0.35*32*1024*1024*1024/1000000;
-  // @ZACH: Floating Point instability?
+  // Floating Point instability?
   double cost(size_t memory, size_t staleness) const {
     TORCH_CHECK(memory > 0);
     TORCH_CHECK(staleness > 0);
-    // Filter Function
-    return 1 / static_cast<double>(memory * staleness); 
-    // return compute_cost.count() / static_cast<double>(memory * staleness);
-  }
-  double compute_cost_func(size_t memory, size_t staleness) const {
-    TORCH_CHECK(memory > 0);
-    TORCH_CHECK(staleness > 0);
     return compute_cost.count() / static_cast<double>(memory * staleness);
-  }
-  double swap_cost_(size_t memory) const {
-    TORCH_CHECK(memory > 0);
-    return static_cast<double>(memory) / bandwidth;
-  }
-  double fake_decision(size_t memory, size_t staleness) const {
-    TORCH_CHECK(memory > 0);
-    TORCH_CHECK(staleness > 0);
-    double swap_cost = static_cast<double>(memory) / bandwidth;
-    return (2 * swap_cost) / compute_cost.count();
   }
   CheckpointInfo(duration_t compute_cost) :
     compute_cost(compute_cost) {
@@ -213,8 +194,6 @@ struct Rematerializer : intrusive_ptr_target {
   strongs inputs;
   weaks outputs;
   duration_t compute_cost;
-  // add for reload
-  duration_t swap_cost; 
   // when some output in here get evicted, they should belong to this ecn.
   // a rematerializer have to track this,
   // because when multiple output of a rematerializer get evicted,
@@ -234,7 +213,6 @@ struct Rematerializer : intrusive_ptr_target {
     outputs.clear();
   }
   void remat();
-  void reload();
   ecn_ptr get_ecn();
   CheckpointInfo get_cpi();
 };
@@ -266,16 +244,8 @@ struct AliasPool : intrusive_ptr_target {
   }
   // if it is not evictable it must not be evicted.
   bool is_evicted = false;
-  bool is_offloaded = false;
-  bool onGPU = true;
-  bool swapped = false;
   size_t memory;
   time_t last_used_time;
-  double swap_cost;
-  std::shared_ptr<Storage> cpuStorage;
-  // for prefetch 
-  // std::queue<strong> offload_queue;
-  // void prefetch();
   // An aliaspool cant register itself to the checkpointpool - you have to do it yourself.
   AliasPool(const Unsafe&, intrusive_ptr<Rematerializer> head_remat, size_t memory) :
     head_remat(head_remat),
@@ -285,10 +255,7 @@ struct AliasPool : intrusive_ptr_target {
   // if it is evicted, then hold the evicted tensor group.
   ecn_ptr ecn;
   double cost(time_t current_time);
-  double compute_cost_func(time_t current_time);
-  double decision_func(time_t current_time);
   void evict();
-  void offload();
   void register_external() {
     ++external_count;
   }
@@ -306,7 +273,6 @@ struct AliasPool : intrusive_ptr_target {
   // have to check so, because when we rematerialize a single tensor in an aliaspool,
   // we will set it to non-evicted, and when we rematerialize it's tensor they will also reset this.
   void set_not_evicted(const intrusive_ptr<AliasPool>& self);
-  void set_not_offloaded(const intrusive_ptr<AliasPool>& self);
   void release_resources() final {
     tensors.clear();
     neighbors.clear();
@@ -318,13 +284,6 @@ struct CheckpointTensorCell : intrusive_ptr_target {
   std::unique_ptr<Tensor> t;
   bool defined = false;
   bool is_undefined_tensor;
-  bool evicted = false;
-  bool offloaded = false;
-  bool onGPU = true;
-  double compute_cost;
-  double swap_cost;
-  std::shared_ptr<Storage> cpuStorage;
-  Tensor cpuTensor;
   DispatchKeySet key_set_;
   DispatchKeySet key_set() const {
     TORCH_CHECK(defined);
@@ -346,15 +305,8 @@ struct CheckpointTensorCell : intrusive_ptr_target {
   intrusive_ptr<Rematerializer> remat;
   void evict() {
     TORCH_CHECK(remat);
-    onGPU = false;
-    evicted = true;
     t.reset();
   }
-  void offload() {
-    TORCH_CHECK(remat);
-    t.reset();
-  }
-  void reload();
   void fill(const Tensor& t);
   explicit CheckpointTensorCell(const Tensor& t, const intrusive_ptr<AliasPool>& pool) : pool(pool) {
     fill(t);
@@ -371,16 +323,11 @@ struct CheckpointTensorCell : intrusive_ptr_target {
   }
   Tensor get() {
     if (! t) {
-      if (evicted) {
-        TORCH_CHECK(remat);
-        remat->remat();
-      } else if (offloaded) {
-        reload();
-      } else { 
-        TORCH_CHECK(false); }
+      TORCH_CHECK(remat);
+      remat->remat();
     }
     TORCH_CHECK(t);
-    TORCH_CHECK(! t->key_set().has(DispatchKey::Checkpoint));
+    TORCH_CHECK(! t->key_set().has(DispatchKey::CheckpointTensorId));
     pool->last_used_time = std::chrono::system_clock::now();
     return *t;
   }
@@ -421,16 +368,9 @@ struct External : intrusive_ptr_target {
 };
 
 inline DispatchKeySet convert_key_set(const DispatchKeySet& t) {
-  // CHECK(!t.has(DispatchKey::Checkpoint));
-  // auto ret = t.add(DispatchKey::Checkpoint);
-  if (!t.has(DispatchKey::Checkpoint)) {
-    auto ret = t.add(DispatchKey::Checkpoint);
-    return ret;
-  }
-  else {
-    auto ret = t;
-    return ret;
-  }
+  CHECK(!t.has(DispatchKey::Checkpoint));
+  auto ret = t.add(DispatchKey::Checkpoint);
+  return ret;
 }
 
 struct CheckpointTensorImpl : TensorImpl {
@@ -513,11 +453,6 @@ struct CheckpointPool {
   void auto_evict();
   void clear_checkpointpool();
   void add(const intrusive_ptr<AliasPool>&);
-  // for prefetch 
-  std::queue<strong> offload_queue;
-  void prefetch();
-  int64_t prefetch_count = 5;
-  // void clear_offload_queue(std::queue<strong> q);
   CheckpointPool();
 };
 
