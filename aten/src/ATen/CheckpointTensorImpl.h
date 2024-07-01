@@ -105,19 +105,31 @@ using mutate_function_t = std::function<void(const Tensors&)>;
 
 using time_t = std::chrono::time_point<std::chrono::system_clock>;
 using duration_t = std::chrono::system_clock::duration;
+
+extern double param_recompute_times; // 声明 recompute_times 的超参数
+
 struct CheckpointInfo {
   duration_t compute_cost;
 
-  double cost(size_t memory, size_t staleness) const {
+  // 新增 recompute_times
+  double cost(size_t memory, size_t staleness, size_t recompute_times) const {
+  // double cost(size_t memory, size_t staleness) const {
     TORCH_CHECK(memory > 0);
     TORCH_CHECK(staleness > 0);
+
+    // 原 dtr
+    // double cost_value = compute_cost.count() / static_cast<double>(memory * staleness);
+
+    // 新增 cost_value 变量存储计算结果
+    double cost_value = compute_cost.count() * std::pow(param_recompute_times, static_cast<double>(recompute_times)) / static_cast<double>(memory * staleness);
 
     // std::cout << "memory: " << memory << std::endl;
     // std::cout << "staleness: " << staleness << std::endl;
     // std::cout << "compute_cost: " << compute_cost.count() << std::endl;
-    // std::cout << "cost: " << compute_cost.count() / static_cast<double>(memory * staleness) << std::endl;
+    // std::cout << "recompute_times: " << recompute_times << std::endl;
+    // std::cout << "cost: " << cost_value << std::endl;
 
-    return compute_cost.count() / static_cast<double>(memory * staleness);
+    return cost_value;
   }
   CheckpointInfo(duration_t compute_cost) :
     compute_cost(compute_cost) {
@@ -172,6 +184,13 @@ struct AliasPool : intrusive_ptr_target {
   size_t memory;
   time_t last_used_time;
 
+  // 新增 recompute_times
+  size_t recompute_times = 0;
+  // 新增 recompute_times++
+  void add_recompute_times() {
+    ++recompute_times;
+  }
+
   AliasPool(const Unsafe&, intrusive_ptr<Rematerializer> head_remat, size_t memory) :
     head_remat(head_remat),
     memory(memory),
@@ -222,7 +241,7 @@ struct CheckpointTensorCell : intrusive_ptr_target {
     TORCH_CHECK(defined);
     return optional_device_;
   }
-  
+
   intrusive_ptr<AliasPool> pool;
   intrusive_ptr<Rematerializer> remat;
   void evict() {

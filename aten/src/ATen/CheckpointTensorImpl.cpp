@@ -34,19 +34,6 @@ struct PerfStats {
 
   PerfStats() : start(Clock::now()), calls(0), timers() {}
 
-  /*Timer track(std::string name) {
-    if (stats) {
-    auto it = this->calls.find(name);
-    if (it != this->calls.end()) {
-      it->second += 1;
-    } else {
-      this->calls.insert({name, 0});
-    }
-
-    return Timer(name, Clock::now());
-    }
-    return Timer();
-    }*/
   void track(const char*) { }
 
   ~PerfStats() {
@@ -58,8 +45,6 @@ struct PerfStats {
 
     Duration total = now - this->start;
 
-    // For now simple strategy, count up all the time taken
-    // by each "tagged call site".
     for (auto timer : timers) {
       auto name = std::get<0>(timer);
       Duration duration = std::get<3>(timer);
@@ -73,9 +58,7 @@ struct PerfStats {
 
     std::vector<std::pair<std::string, Duration>> data;
 
-    // Convert the durations
     for (auto d : durations) {
-      // auto duration = std::chrono::duration_cast<FinalTime>(d.second);
       data.push_back(d);
     }
 
@@ -133,6 +116,8 @@ long remat_compute_time_ = 0;
 long search_time_ = 0;
 long cost_time_ = 0;
 
+double param_recompute_times = 2; // 定义 recompute_times 的超参数
+
 long evict_count = 0;
 
 CheckpointPool pool;
@@ -158,7 +143,6 @@ void CheckpointPool::auto_evict() {
 }
 
 void CheckpointPool::evict() {
-  time_t pre = std::chrono::system_clock::now();
   STATS.track("CheckpointPool::evict");
   TORCH_CHECK(aps.size() > 0);
   bool shrunk = false;
@@ -211,8 +195,6 @@ void CheckpointPool::evict() {
     evict_count += 1;
   }
   // std::cout << "evict count is: " << evict_count << std::endl;
-  time_t post = std::chrono::system_clock::now();
-  search_time_ += (post - pre).count();
 }
 
 CheckpointPool::CheckpointPool() { }
@@ -353,7 +335,6 @@ Tensors uncheckpoint(const strongs& inputs) {
   Tensors ret;
   ret.reserve(inputs.size());
   for (const strong& input : inputs) {
-    // inlined manually
     ret.push_back(input->get());
   }
   return ret;
@@ -394,15 +375,14 @@ void AliasPool::evict() {
 }
 
 double AliasPool::cost(time_t current_time) {
-  time_t pre = std::chrono::system_clock::now();
   auto cpi = head_remat->get_cpi();
   auto ecns = neighbor_ecn();
   for (const auto& necn : ecns) {
     cpi = merge_cpi(cpi, get_t(necn));
   }
-  auto ret = cpi.cost(memory, (current_time - last_used_time).count());
-  time_t post = std::chrono::system_clock::now();
-  cost_time_ += (post - pre).count();
+  // 新增 recompute_times
+  auto ret = cpi.cost(memory, (current_time - last_used_time).count(), recompute_times);
+  // auto ret = cpi.cost(memory, (current_time - last_used_time).count());
   return ret;
 }
 
@@ -416,15 +396,15 @@ void Rematerializer::remat() {
     s->pool->lock();
   }
   Tensors ts = uncheckpoint(inputs);
-  time_t pre = std::chrono::system_clock::now();
   auto ret = func(ts);
-  time_t post = std::chrono::system_clock::now();
   pool.auto_evict();
-  remat_compute_time_ += (post - pre).count();
   TORCH_CHECK(ret.size() == outputs.size());
   for (size_t i = 0; i < outputs.size(); ++i) {
     if (auto output_cell = outputs[i].lock()) {
       output_cell->fill(ret[i]);
+      // 新增 recompute_times
+      output_cell->pool->add_recompute_times();
+      // std::cout << "Recompute times for pool: " << output_cell->pool->recompute_times << std::endl;
     }
   }
   ecn.reset();
@@ -557,7 +537,6 @@ MakeRawResult make_raw(const rematerialize_function_t& remat_f,
   auto raw_outputs = remat_f(raw_inputs);
   time_t post = std::chrono::system_clock::now();
   pool.auto_evict();
-  base_compute_time_ += (post - pre).count();
   std::vector<intrusive_ptr<External>> outputs;
   std::vector<int> aliases;
   weaks weak_outputs;
