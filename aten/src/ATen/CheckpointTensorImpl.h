@@ -26,61 +26,8 @@
 #define unlikely(x)    __builtin_expect(!!(x), 0)
 #define TORCH_CHECK(a, ...) // profile mode
 
-// System Description:
-// Every Tensor is managed by a CheckpointTensor,
-// that describe how it is computed, (the function and the inputs)
-// And might optionally hold the tensor value.
-// The tensor value might be dropped, and when requested later, recomputed and cached again.
-
-// Corner Cases:
-// A CheckpointedTensor might require_grad.
-//   In this case the underlying data must not require_grad,
-//   as we want backpropagation on the outer, uncheckpoined level.
-//   To be more specific, suppose a tensor is recomputed multiple times.
-//   We want to only compute the gradient exactly once.
-//   To do this, the wrapper must be require_grad, and the wrapped value must not.
-// A CheckpointedTensor might be constant.
-//   In this case it is unevictable.
-// An operator might return multiple output.
-//   In this case the computation info (rematerializer) is shared between all of them,
-//   And when the function get computed again all value get cached.
-// An operator might not return value, but only mutate input value.
-//   To combat this, we COW the operator, and wrap CheckpopintTensor with a Ref.
-//   By doing this the inner CheckpointTensor is kept purely functional.
-// An operator might try to mutate uncheckpointed tensor.
-//   We do not support this and will error.
-// An operator might create aliases.
-//   We track alias in AliasPool.
-//   Each AliasPool hold a set of tensor that is alias to eachother.
-// An operator might try to create Alias to an unevictable tensor.
-//   In such a case the output tensor is unevictable.
-// An operator might try to mutate Tensor with Alias.
-//   We do not support this case an will error if a Tensor has any alive Alias.
-//   However it could be done without a major redesign of the system -
-//   Each AliasPool will hold weak pointers to the External Reference.
-//   When alias mutation occur,
-//   we make a rematerialize_function that take in the base tensor (other tensor alias from)
-//   and output all the new value of the aliases, then update the Ref.
-//   Of course, the cleaner way is to not support this.
-//   Shame on those who use this feature.
-
-// Memory Safety:
-// The objects here will have lots of backedges.
-// In order to collect memory when computation is completed,
-// We require that all strong pointer is of the form of value -> input.
-// This ensure that everything will be released if there is no external ref whatsoever.
-
-// Optimization:
-// We treat tensor that has no external reference differently -
-// They will never be externally used again so we assume their next use time is infinite
-// so, if it doesnt has any evicted neighbor it will get evicted immediately.
-
-// Note: to code fast I do not use RAII and just assume the code will not try to recover from exception.
-// It should be easy to fix though.
-
 namespace at {
 
-// TODO: using a pool allocator might make more sense - no need to allocate and delete each pointer individually.
 template<typename T>
 struct EquivalentClassNode : intrusive_ptr_target {
   explicit EquivalentClassNode(const T& t) : t_unsafe(t) { }
@@ -160,10 +107,16 @@ using time_t = std::chrono::time_point<std::chrono::system_clock>;
 using duration_t = std::chrono::system_clock::duration;
 struct CheckpointInfo {
   duration_t compute_cost;
-  // Floating Point instability?
+
   double cost(size_t memory, size_t staleness) const {
     TORCH_CHECK(memory > 0);
     TORCH_CHECK(staleness > 0);
+
+    // std::cout << "memory: " << memory << std::endl;
+    // std::cout << "staleness: " << staleness << std::endl;
+    // std::cout << "compute_cost: " << compute_cost.count() << std::endl;
+    // std::cout << "cost: " << compute_cost.count() / static_cast<double>(memory * staleness) << std::endl;
+
     return compute_cost.count() / static_cast<double>(memory * staleness);
   }
   CheckpointInfo(duration_t compute_cost) :
@@ -171,33 +124,15 @@ struct CheckpointInfo {
   }
 };
 
-// ecn represent a evicted tensor group.
-// it is a set of tensor that are evicted, and if two evicted tensor are input -> output to each other,
-// they must be in an ecn.
-// note: we try to support removal from ecn by subtracting compute_cost and memory.
-// this will create suprious connection but that should be fine empircally.
-// below is an example of a suprious connection:
-// a -> b, a -> c
-// a, b, c got evicted so belong to a single ecn.
-// a got rematerialized.
-// b, c still belong to a single ecn although there is no connection.
 using ecn_ptr = intrusive_ptr<EquivalentClassNode<CheckpointInfo>>;
 
 struct Unsafe { };
 
-// The rematerializer could be called to reinvoke an operator.
-// Tensor point to remat which point to Tensor.
-// To build the cycle remat support a default constructor,
-// And allow you to fill in the member later.
 struct Rematerializer : intrusive_ptr_target {
   rematerialize_function_t func;
   strongs inputs;
   weaks outputs;
   duration_t compute_cost;
-  // when some output in here get evicted, they should belong to this ecn.
-  // a rematerializer have to track this,
-  // because when multiple output of a rematerializer get evicted,
-  // we only want to count the compute cost once.
   ecn_ptr ecn;
   Rematerializer(const Unsafe&,
                  const rematerialize_function_t& func,
@@ -217,19 +152,10 @@ struct Rematerializer : intrusive_ptr_target {
   CheckpointInfo get_cpi();
 };
 
-// Track all Tensor that share the same Storage.
-// This is the atomic level of eviction - when evicting, everything here will get evicted.
-// When an AliasPool is evicted, the Storage of the underlying tensor must be freed.
-// Additionally, the AliasPool contain weak pointer to all children of tensors,
-// in order to compute the score of evicting a Storage.
 struct AliasPool : intrusive_ptr_target {
   weaks tensors;
   weaks neighbors;
   std::set<ecn_ptr> neighbor_ecn();
-  // get() might hold some raw Tensor, rendering them unevictable.
-  // it is likely that get() will run out of memory, and when it does so, it will try to evict.
-  // so, it is crucial that we dont try to evict those tensors - doing so will not evict anything.
-  // lock_count count how many time a tensor is referenced by get.
   size_t lock_count = 0;
   size_t external_count = 0;
   void lock() {
@@ -242,17 +168,16 @@ struct AliasPool : intrusive_ptr_target {
   bool evictable() const {
     return lock_count == 0 && head_remat;
   }
-  // if it is not evictable it must not be evicted.
   bool is_evicted = false;
   size_t memory;
   time_t last_used_time;
-  // An aliaspool cant register itself to the checkpointpool - you have to do it yourself.
+
   AliasPool(const Unsafe&, intrusive_ptr<Rematerializer> head_remat, size_t memory) :
     head_remat(head_remat),
     memory(memory),
     last_used_time(std::chrono::system_clock::now()) {
   }
-  // if it is evicted, then hold the evicted tensor group.
+  
   ecn_ptr ecn;
   double cost(time_t current_time);
   void evict();
@@ -269,9 +194,7 @@ struct AliasPool : intrusive_ptr_target {
       }
     }
   }
-  // if it was evicted, refresh it. otherwise do nothing.
-  // have to check so, because when we rematerialize a single tensor in an aliaspool,
-  // we will set it to non-evicted, and when we rematerialize it's tensor they will also reset this.
+  
   void set_not_evicted(const intrusive_ptr<AliasPool>& self);
   void release_resources() final {
     tensors.clear();
@@ -299,8 +222,7 @@ struct CheckpointTensorCell : intrusive_ptr_target {
     TORCH_CHECK(defined);
     return optional_device_;
   }
-  // A Tensor is evictable iff it's AliasPool is evictable.
-  // A evictable tensor must have Rematerializer.
+  
   intrusive_ptr<AliasPool> pool;
   intrusive_ptr<Rematerializer> remat;
   void evict() {
@@ -327,7 +249,7 @@ struct CheckpointTensorCell : intrusive_ptr_target {
       remat->remat();
     }
     TORCH_CHECK(t);
-    TORCH_CHECK(! t->key_set().has(DispatchKey::CheckpointTensorId));
+    TORCH_CHECK(! t->key_set().has(DispatchKey::Checkpoint));
     pool->last_used_time = std::chrono::system_clock::now();
     return *t;
   }
@@ -343,13 +265,6 @@ struct CheckpointTensorCell : intrusive_ptr_target {
   }
 };
 
-// An external reference.
-// Each strong will have at most one external reference.
-// By keeping such an invariant, whenever an external reference die,
-// We know that the underlying strong is only used internally.
-// Thus, when it die we can apply optimization like banishing/infinite staleness.
-// We keep this invariant by only allowing CheckpointTensorImpl to make new External,
-// When new CheckpointTensorImpl is constructed.
 struct External : intrusive_ptr_target {
   External(const strong& value) : value(value) {
     value->pool->register_external();
@@ -406,7 +321,6 @@ struct CheckpointTensorImpl : TensorImpl {
                       const rematerialize_function_t& remat,
                       const Tensors& inputs);
 
-  // mutate_idx indicate which of the inputs will get mutated.
   static void mutate(const std::string& name,
                      const mutate_function_t& mutate,
                      const Tensors& inputs,
@@ -437,15 +351,14 @@ struct CheckpointTensorImpl : TensorImpl {
   }
 };
 
-// CheckpointPool keep a list of AliasPool, and search over them to choose the best one to evict.
 struct CheckpointPool {
   std::vector<weak_intrusive_ptr<AliasPool>> aps;
   std::vector<weak_intrusive_ptr<External>> exts;
   std::random_device rd;
   std::mt19937 gen = std::mt19937(rd());
-  // whether to take a square-root sample of the pool during an eviction loop
+
   bool sample_tensors = false;
-  // ignore tensors < 1% of the average tensor size
+
   bool ignore_small_tensors = true;
   bool has_memory_budget = false;
   long memory_budget;

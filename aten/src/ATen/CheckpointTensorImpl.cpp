@@ -161,7 +161,6 @@ void CheckpointPool::evict() {
   time_t pre = std::chrono::system_clock::now();
   STATS.track("CheckpointPool::evict");
   TORCH_CHECK(aps.size() > 0);
-  // shrunk: either something has been evicted or the pools have gotten smaller
   bool shrunk = false;
   int evict_idx = -1;
   double evict_cost = INFINITY;
@@ -171,7 +170,6 @@ void CheckpointPool::evict() {
                            aps.pop_back();
                          };
   std::uniform_int_distribution<> distrib(1, 1 * std::max(1, static_cast<int>(std::sqrt(aps.size()))));
-  // sampling a random independent subset of all evictable tensors to find the cheapest tensor to evict.
   for (size_t i = 0; i < aps.size();) {
     auto cannot_evict = [&]() {
                           shrunk = true;
@@ -212,7 +210,7 @@ void CheckpointPool::evict() {
     evict_from_idx(evict_idx);
     evict_count += 1;
   }
-  std::cout << "evict count is: " << evict_count << std::endl;
+  // std::cout << "evict count is: " << evict_count << std::endl;
   time_t post = std::chrono::system_clock::now();
   search_time_ += (post - pre).count();
 }
@@ -414,7 +412,6 @@ void External::release_resources() {
 }
 
 void Rematerializer::remat() {
-  // TODO: refactor using RAII for exception safety.
   for (const strong& s : inputs) {
     s->pool->lock();
   }
@@ -511,7 +508,7 @@ intrusive_ptr<TensorImpl> CheckpointTensorImpl::shallow_copy_and_detach(const Va
 
 void CheckpointTensorImpl::shallow_copy_from(const c10::intrusive_ptr<TensorImpl>& impl) {
   STATS.track("CheckpointTensorCell::shallow_copy_from");
-  TORCH_CHECK(impl->key_set().has(DispatchKey::CheckpointTensorId));
+  TORCH_CHECK(impl->key_set().has(DispatchKey::Checkpoint));
   auto* cpti = dynamic_cast<CheckpointTensorImpl*>(impl.get());
   TORCH_CHECK(cpti != nullptr);
   ref->value = cpti->ref->value;
@@ -526,10 +523,6 @@ bool is_alias(const Tensor& l, const Tensor& r) {
   return l.defined() && r.defined() && l.is_alias_of(r);
 }
 
-// return an index for alias.
-// we dont care which one because they all lead to the same alias pool.
-// return -1 for no alias.
-// may god forgive my sin.
 int get_alias(const Tensors& ts, const Tensor& t) {
   if (t.defined()) {
     for (size_t i = 0; i < ts.size(); ++i) {
@@ -553,11 +546,6 @@ void add_neighbor(const strong& l, const strong& r) {
   r->pool->neighbors.push_back(weak(l));
 }
 
-// remat take a single vector of tensors,
-// while there are two vector, one storing nonconstants and one storing constants.
-// the constants are small and they will not be considered for eviction.
-// however, we have to stitch the two vectors together to pass it in remat.
-// the size_t in constants decide the location to stitch them in, while input_values fill in the rest.
 MakeRawResult make_raw(const rematerialize_function_t& remat_f,
                        const strongs& inputs) {
   STATS.track("make_raw");
@@ -666,7 +654,6 @@ Tensors CheckpointTensorImpl::make(const std::string& name,
   return tensors;
 }
 
-// TODO: check that mutated value does not have alias.
 void CheckpointTensorImpl::mutate(const std::string& name,
                                   const mutate_function_t& mutate,
                                   const Tensors& inputs,
