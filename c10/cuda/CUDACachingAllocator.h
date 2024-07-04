@@ -123,6 +123,10 @@ C10_CUDA_API std::vector<SegmentInfo> snapshot();
 C10_CUDA_API std::mutex* getFreeMutex();
 
 C10_CUDA_API std::shared_ptr<void> getIpcDevPtr(std::string handle);
+
+// 新增获取 tensor 左右两侧总空闲量的函数
+C10_CUDA_API size_t getSidesFreeMem(void *ptr);
+
 } // namespace CUDACachingAllocator
 
 }} // namespace c10::cuda

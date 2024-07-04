@@ -112,7 +112,8 @@ struct CheckpointInfo {
   duration_t compute_cost;
 
   // 新增 recompute_times
-  double cost(size_t memory, size_t staleness, size_t recompute_times) const {
+  // double cost(size_t memory, size_t free_mem, size_t staleness, size_t recompute_times) const {
+  double cost(size_t memory, size_t free_mem, size_t staleness) const {
   // double cost(size_t memory, size_t staleness) const {
     TORCH_CHECK(memory > 0);
     TORCH_CHECK(staleness > 0);
@@ -121,13 +122,17 @@ struct CheckpointInfo {
     // double cost_value = compute_cost.count() / static_cast<double>(memory * staleness);
 
     // 新增 cost_value 变量存储计算结果
-    double cost_value = compute_cost.count() * std::pow(param_recompute_times, static_cast<double>(recompute_times)) / static_cast<double>(memory * staleness);
+    // double cost_value = compute_cost.count() * std::pow(param_recompute_times, static_cast<double>(recompute_times)) / static_cast<double>((memory + free_mem) * staleness);
+    
+    // 新增 free_mem 变量
+    double cost_value = compute_cost.count() / static_cast<double>((memory + free_mem) * staleness);
 
-    // std::cout << "memory: " << memory << std::endl;
-    // std::cout << "staleness: " << staleness << std::endl;
-    // std::cout << "compute_cost: " << compute_cost.count() << std::endl;
+    std::cout << "memory: " << memory << std::endl;
+    std::cout << "free_mem: " << free_mem << std::endl;
+    std::cout << "staleness: " << staleness << std::endl;
+    std::cout << "compute_cost: " << compute_cost.count() << std::endl;
     // std::cout << "recompute_times: " << recompute_times << std::endl;
-    // std::cout << "cost: " << cost_value << std::endl;
+    std::cout << "cost: " << cost_value << std::endl;
 
     return cost_value;
   }
@@ -182,6 +187,8 @@ struct AliasPool : intrusive_ptr_target {
   }
   bool is_evicted = false;
   size_t memory;
+  // 新增 free_mem
+  size_t free_mem = 0;
   time_t last_used_time;
 
   // 新增 recompute_times

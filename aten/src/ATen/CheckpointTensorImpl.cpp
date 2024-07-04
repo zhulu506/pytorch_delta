@@ -102,6 +102,19 @@ inline size_t memory(const Tensor& t) {
   return res;
 }
 
+// 新增，获取 tensor 左右相邻空闲显存块的大小，前提是 tensor 在显存中是被分割过的。
+inline size_t sides_free_mem(const Tensor& t){
+  if (! t.has_storage()) {
+    return 0;
+  }
+  auto& storage = t.storage();
+  // 获取该 tensor 数据的内存指针
+  auto begin_ptr = storage.data_ptr().get();
+  
+  return c10::cuda::CUDACachingAllocator::getSidesFreeMem(begin_ptr);
+}
+
+
 Timer::~Timer() {
   Time now = Clock::now();
   Duration elapsed = now - start;
@@ -381,7 +394,19 @@ double AliasPool::cost(time_t current_time) {
     cpi = merge_cpi(cpi, get_t(necn));
   }
   // 新增 recompute_times
-  auto ret = cpi.cost(memory, (current_time - last_used_time).count(), recompute_times);
+  // auto ret = cpi.cost(memory, (current_time - last_used_time).count(), recompute_times);
+
+  if(!tensors.empty()) {
+    auto strongCell = tensors[0].lock();
+    if(strongCell && strongCell->t) {
+      free_mem = sides_free_mem(*(strongCell->t));
+      std::cout << "sides_free_mem: " << free_mem << std::endl;
+    }
+  }
+
+  // 新增 free_mem
+  auto ret = cpi.cost(memory, free_mem, (current_time - last_used_time).count());
+
   // auto ret = cpi.cost(memory, (current_time - last_used_time).count());
   return ret;
 }
