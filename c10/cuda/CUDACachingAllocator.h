@@ -123,6 +123,9 @@ C10_CUDA_API std::vector<SegmentInfo> snapshot();
 C10_CUDA_API std::mutex* getFreeMutex();
 
 C10_CUDA_API std::shared_ptr<void> getIpcDevPtr(std::string handle);
+
+// updated by zjma
+C10_CUDA_API size_t getSidesFreeMem(void *ptr);
 } // namespace CUDACachingAllocator
 
 }} // namespace c10::cuda

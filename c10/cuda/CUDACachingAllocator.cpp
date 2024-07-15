@@ -486,6 +486,21 @@ class DeviceCachingAllocator {
     }
   }
 
+  // updated by zjma
+  size_t getSidesFreeMem(Block* block) {
+    std::lock_guard<std::recursive_mutex> lock(mutex);
+    size_t freeMem = 0;
+    if(block->is_split()) {
+      if(block->prev && !block->prev->allocated && block->event_count == 0){
+        freeMem += block->prev->size;
+      }
+      if(block->next && !block->next->allocated && block->event_count == 0){
+        freeMem += block->next->size;
+      }
+    }
+    return freeMem;
+  }
+
  private:
 
   // All private methods do not acquire the allocator mutex.
@@ -892,6 +907,15 @@ class THCCachingAllocator {
 
     return result;
   }
+
+  // updated by zjma
+  size_t getSidesFreeMem(void *ptr) {
+    Block* block = get_allocated_block(ptr);
+    if (!block) {
+      AT_ERROR("invalid device pointer: ", ptr);
+    }
+    return device_allocator[block->device]->getSidesFreeMem(block);
+  }
 };
 
 THCCachingAllocator caching_allocator;
@@ -1050,6 +1074,11 @@ void* raw_alloc_with_stream(size_t nbytes, cudaStream_t stream) {
 
 void raw_delete(void* ptr) {
   caching_allocator.free(ptr);
+}
+
+// updated by zjma
+size_t getSidesFreeMem(void *ptr) {
+  return caching_allocator.getSidesFreeMem(ptr);
 }
 
 } // namespace CUDACachingAllocator

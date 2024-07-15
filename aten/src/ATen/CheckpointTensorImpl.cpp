@@ -131,8 +131,9 @@ Timer::~Timer() {
   STATS.timers.push_back(stats);
 }
 
-bool use_log_ = true;
-bool use_profile_ = true;
+// update by zjma
+bool use_log_ = false;
+bool use_profile_ = false;
 long base_compute_time_ = 0;
 long remat_compute_time_ = 0;
 long search_time_ = 0;
@@ -221,15 +222,17 @@ void CheckpointPool::evict() {
   } else {
     auto release_aps = aps[evict_idx].lock();
     double real_decision;
-    std::cout << "release_aps->swapped " << release_aps->swapped << std::endl;
-    if (release_aps->swapped) {
-      double _computed_cost = release_aps->compute_cost_func(current_time);
-      double _swap_cost = release_aps->swap_cost;
-      real_decision = _swap_cost / _computed_cost;
-    } else {
-      real_decision = release_aps->decision_func(current_time);
-    }
-    std::cout << "decision is  " << real_decision << std::endl;
+    // std::cout << "release_aps->swapped " << release_aps->swapped << std::endl;
+    // if (release_aps->swapped) {
+    //   double _computed_cost = release_aps->compute_cost_func(current_time);
+    //   double _swap_cost = release_aps->swap_cost;
+    //   real_decision = _swap_cost / _computed_cost;
+    // } else {
+    //   real_decision = release_aps->decision_func(current_time);
+    // }
+    // update by zjma
+    real_decision = release_aps->decision_func(current_time);
+    std::cout << "decision is: " << real_decision << std::endl;
     auto evict_from_idx = [&](size_t idx) {
                             auto ap_strong = aps[idx].lock();
                             TORCH_CHECK(ap_strong.defined());
@@ -539,41 +542,51 @@ void AliasPool::offload() {
   // std::cout << "offload finished  " << std::endl;
 }
 
-double AliasPool::cost(time_t current_time) {
-  time_t pre = std::chrono::system_clock::now();
-  auto cpi = head_remat->get_cpi();
-  auto ecns = neighbor_ecn();
-  // for (const auto& necn : ecns) {
-  //   cpi = merge_cpi(cpi, get_t(necn));
-  // }
-  auto ret = cpi.cost(memory, (current_time - last_used_time).count());
-  time_t post = std::chrono::system_clock::now();
-  cost_time_ += (post - pre).count();
-  return ret;
+// updated by zjma
+inline size_t sides_free_mem(const Tensor& t){
+  if (! t.has_storage()) {
+    return 0;
+  }
+  return c10::cuda::CUDACachingAllocator::getSidesFreeMem(t.storage().data_ptr().get());
 }
 
-double AliasPool::compute_cost_func(time_t current_time) {
-  time_t pre = std::chrono::system_clock::now();
+// updated by zjma
+double AliasPool::cost(time_t current_time) {
   auto cpi = head_remat->get_cpi();
   auto ecns = neighbor_ecn();
   for (const auto& necn : ecns) {
     cpi = merge_cpi(cpi, get_t(necn));
   }
-  auto ret = cpi.compute_cost_func(memory, (current_time - last_used_time).count());
-  time_t post = std::chrono::system_clock::now();
-  cost_time_ += (post - pre).count();
+  if(!tensors.empty()) {
+    auto strongCell = tensors[0].lock();
+    if(strongCell && strongCell->t) {
+      free_mem = sides_free_mem(*(strongCell->t));
+    }
+  }
+  auto ret = cpi.cost(memory, (current_time - last_used_time).count(), free_mem);
   return ret;
 }
 
+// double AliasPool::compute_cost_func(time_t current_time) {
+//   time_t pre = std::chrono::system_clock::now();
+//   auto cpi = head_remat->get_cpi();
+//   auto ecns = neighbor_ecn();
+//   for (const auto& necn : ecns) {
+//     cpi = merge_cpi(cpi, get_t(necn));
+//   }
+//   auto ret = cpi.compute_cost_func(memory, (current_time - last_used_time).count());
+//   time_t post = std::chrono::system_clock::now();
+//   cost_time_ += (post - pre).count();
+//   return ret;
+// }
+
 double AliasPool::decision_func(time_t current_time) {
-  time_t pre = std::chrono::system_clock::now();
   auto cpi = head_remat->get_cpi();
-  // auto ecns = neighbor_ecn();
-  // for (const auto& necn : ecns) {
-  //   cpi = merge_cpi(cpi, get_t(necn));
-  // }
+  auto ecns = neighbor_ecn();
+  for (const auto& necn : ecns) {
+    cpi = merge_cpi(cpi, get_t(necn));
+  }
   auto ret = cpi.fake_decision(memory, (current_time - last_used_time).count());
-  time_t post = std::chrono::system_clock::now();
   return ret;
 }
 

@@ -161,29 +161,31 @@ using time_t = std::chrono::time_point<std::chrono::system_clock>;
 using duration_t = std::chrono::system_clock::duration;
 struct CheckpointInfo {
   duration_t compute_cost;
-  double bandwidth = 0.35*32*1024*1024*1024/1000000;
-  // @ZACH: Floating Point instability?
-  double cost(size_t memory, size_t staleness) const {
+  double bandwidth = (12.0 * 1024 * 1024 * 1024) / (1000 * 1000 * 1000);  // updated by zjma
+  // updated by zjma
+  double cost(size_t memory, size_t staleness, size_t free_mem) const {
     TORCH_CHECK(memory > 0);
     TORCH_CHECK(staleness > 0);
-    // Filter Function
-    return 1 / static_cast<double>(memory * staleness); 
-    // return compute_cost.count() / static_cast<double>(memory * staleness);
+    double cost_value = std::min(compute_cost_(), swap_cost_(memory)) / static_cast<double>((memory + free_mem) * std::pow(staleness, 1));
+    std::cout << "memory: " << memory << std::endl;
+    std::cout << "free_mem: " << free_mem << std::endl;
+    std::cout << "staleness: " << staleness << std::endl;
+    std::cout << "compute cost: " << compute_cost.count() << std::endl;
+    std::cout << "cost_value: " << cost_value << std::endl;
+    return cost_value;
   }
-  double compute_cost_func(size_t memory, size_t staleness) const {
-    TORCH_CHECK(memory > 0);
-    TORCH_CHECK(staleness > 0);
-    return compute_cost.count() / static_cast<double>(memory * staleness);
+  // updated by zjma
+  double compute_cost_() const {
+    return static_cast<double>(compute_cost.count());
   }
   double swap_cost_(size_t memory) const {
     TORCH_CHECK(memory > 0);
-    return static_cast<double>(memory) / bandwidth;
+    return 2 * static_cast<double>(memory) / bandwidth; // updated by zjma
   }
   double fake_decision(size_t memory, size_t staleness) const {
     TORCH_CHECK(memory > 0);
     TORCH_CHECK(staleness > 0);
-    double swap_cost = static_cast<double>(memory) / bandwidth;
-    return (2 * swap_cost) / compute_cost.count();
+    return std::pow(swap_cost_(memory), 0.6) / compute_cost_(); // updated by zjma
   }
   CheckpointInfo(duration_t compute_cost) :
     compute_cost(compute_cost) {
@@ -312,6 +314,13 @@ struct AliasPool : intrusive_ptr_target {
     neighbors.clear();
     head_remat.reset();
   }
+
+  // updated by zjma
+  size_t free_mem = 0;
+  // size_t recompute_times = 0;
+  // void add_recompute_times() {
+  //   ++recompute_times;
+  // }
 };
 
 struct CheckpointTensorCell : intrusive_ptr_target {
